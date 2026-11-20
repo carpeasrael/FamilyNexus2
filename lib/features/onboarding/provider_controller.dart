@@ -1,0 +1,175 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+
+import '../../core/app_log.dart';
+import '../../data/matrix/matrix_gateway.dart';
+import '../../domain/app_settings.dart';
+import '../../domain/registration.dart';
+import '../../domain/server.dart';
+
+/// `empty`: eigener Anbieter gewählt, aber noch keine Adresse eingegeben. `needsConsent`: Server im
+/// Heimnetz aus einer Einladung – verbunden wird erst nach ausdrücklichem Tipp (Review R2, Issue #6).
+enum ProviderStatus { empty, needsConsent, checking, ready, invalid, failed }
+
+/// Gewählter Anbieter (Homeserver) in der Einrichtung (E-55). Die Prüfung läuft automatisch: für den
+/// Standard bzw. den Anbieter aus der Einladung sofort, für eine eigene Eingabe nach kurzer Pause.
+/// Ergebnis sind Erreichbarkeit, Betreiberangaben und der Weg zur Kontoanlage.
+class ProviderController extends ChangeNotifier {
+  ProviderController({
+    required this.gateway,
+    ServerUrl? initial,
+    this.debounce = const Duration(milliseconds: 800),
+  }) : _standard = initial ?? ServerUrl.tryParse(AppSettings.defaultServerUrl)!;
+
+  final MatrixGateway gateway;
+  final Duration debounce;
+
+  final ServerUrl _standard;
+  bool _custom = false;
+  String _customText = '';
+  ProviderStatus _status = ProviderStatus.checking;
+  ServerInfo? _info;
+  RegistrationOptions? _options;
+  GatewayError? _error;
+  Timer? _timer;
+  int _run = 0;
+  bool _started = false;
+  bool _disposed = false;
+
+  /// Der Standard-Anbieter (`matrix.org`), unabhängig vom zuletzt benutzten Server.
+  ServerUrl get standard => _standard;
+  bool get custom => _custom;
+  String get customText => _customText;
+  ProviderStatus get status => _status;
+  ServerInfo? get info => _info;
+  RegistrationOptions? get options => _options;
+  GatewayError? get error => _error;
+
+  /// Aktuell gewählter Anbieter (`null` bei ungültiger eigener Eingabe).
+  ServerUrl? get server => _custom ? ServerUrl.tryParse(_customText) : _standard;
+
+  bool get ready => _status == ProviderStatus.ready && _info != null;
+  bool get usesOAuth => _info?.usesOAuth ?? false;
+  RegistrationMode? get mode => _options?.mode;
+
+  /// Erste Prüfung des Standard-Anbieters.
+  void start() {
+    _started = true;
+    _check(immediate: true);
+  }
+
+  /// Wählt einen fest vorgegebenen Anbieter (Einladung E-63, oder `@anna:beispiel.de` bei der Anmeldung):
+  /// `matrix.org` bleibt der Standard, jeder andere Server wird als „Anderer Anbieter“ mit seiner Adresse
+  /// eingetragen. Der Standard wandert nie auf den zuletzt benutzten Server.
+  ///
+  /// [askFirst]: nicht sofort verbinden (Server im Heimnetz aus einer Einladung), sondern erst nach
+  /// [connect].
+  void useServer(ServerUrl url, {bool askFirst = false}) {
+    final isStandard = url == _standard;
+    final text = url.uri.hasPort ? '${url.host}:${url.uri.port}' : url.host;
+    if (_started && _custom == !isStandard && (isStandard || _customText == text) && _status != ProviderStatus.failed) return;
+    _custom = !isStandard;
+    if (!isStandard) _customText = text;
+    if (askFirst) {
+      _started = true;
+      _timer?.cancel();
+      _run++;
+      _info = null;
+      _options = null;
+      _error = null;
+      _status = ProviderStatus.needsConsent;
+      _notify();
+      return;
+    }
+    start();
+  }
+
+  /// Zurück auf den Standard-Anbieter, ohne selbst zu prüfen oder zu benachrichtigen (E-108, #545): Wer eine Einladung
+  /// verworfen oder auf der Startseite neu gewählt hat, soll den Server des Einladenden oder einer früheren
+  /// Eingabe nicht behalten (ein Heimnetz-Server würde sonst ohne Zustimmung geprüft, Review R2). Ein folgendes
+  /// [start] prüft genau einmal.
+  void resetToStandard() {
+    _timer?.cancel();
+    _run++;
+    _custom = false;
+    _customText = '';
+    _info = null;
+    _options = null;
+    _error = null;
+    _status = ProviderStatus.checking;
+  }
+
+  /// Verbindung nach Zustimmung herstellen (siehe [ProviderStatus.needsConsent]).
+  void connect() => _check(immediate: true);
+
+  void setCustom(bool on) {
+    if (on == _custom) return;
+    _custom = on;
+    _check(immediate: !on);
+  }
+
+  void setCustomText(String text) {
+    _customText = text;
+    _check(immediate: false);
+  }
+
+  /// Erneut prüfen (z. B. „Nochmal versuchen“ nach einem Netzfehler).
+  void retry() => _check(immediate: true);
+
+  void _check({required bool immediate}) {
+    _timer?.cancel();
+    final run = ++_run;
+    _info = null;
+    _options = null;
+    _error = null;
+    final url = server;
+    if (url == null) {
+      _status = _custom && _customText.trim().isEmpty ? ProviderStatus.empty : ProviderStatus.invalid;
+      _notify();
+      return;
+    }
+    _status = ProviderStatus.checking;
+    _notify();
+    if (immediate) {
+      unawaited(_probe(url, run));
+    } else {
+      _timer = Timer(debounce, () => unawaited(_probe(url, run)));
+    }
+  }
+
+  Future<void> _probe(ServerUrl url, int run) async {
+    try {
+      final info = await gateway.probeServer(url);
+      // Vorübergehende Fehler (Netz, Überlastung) melden wie bei der Serverprüfung – mit „Erneut
+      // versuchen“ statt eines falschen „kein Konto möglich“.
+      final options = await gateway.registrationOptions(url);
+      if (run != _run || _disposed) return;
+      _info = info;
+      _options = options;
+      _status = ProviderStatus.ready;
+    } on GatewayException catch (e) {
+      if (run != _run || _disposed) return;
+      _error = e.error;
+      _status = ProviderStatus.failed;
+    } catch (e) {
+      if (run != _run || _disposed) return;
+      // Kein Gateway-Fehler: Die Oberfläche zeigt „unbekannt“, die Ursache steht im Protokoll (nur der Typ).
+      AppLog.e('onboarding', 'Anbieter-Prüfung fehlgeschlagen', e);
+      _error = GatewayError.unknown;
+      _status = ProviderStatus.failed;
+    }
+    _notify();
+  }
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _timer?.cancel();
+    super.dispose();
+  }
+}

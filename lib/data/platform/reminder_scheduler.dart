@@ -1,0 +1,297 @@
+import 'dart:async';
+
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/timezone.dart' as tz;
+import 'package:url_launcher/url_launcher.dart';
+
+import '../../core/app_log.dart';
+import '../../core/platform_info.dart';
+import '../../domain/reminder_planner.dart';
+import '../../domain/time_zones.dart';
+import 'in_app_reminders.dart';
+
+enum ReminderPermission {
+  granted,
+
+  /// Benachrichtigungen sind blockiert: Erinnerungen erscheinen nicht.
+  notificationsDenied,
+
+  /// Genaue Alarme fehlen: Erinnerungen können sich verspäten.
+  exactAlarmMissing,
+}
+
+/// Plant lokale Erinnerungen (E-15). Die Benachrichtigung enthält **nie**
+/// Termininhalte: nur einen festen Titel und „in n Minuten“.
+abstract class ReminderScheduler {
+  Future<void> initialize({required String channelName, required String channelDescription});
+
+  Future<ReminderPermission> permission();
+
+  /// Fragt die Berechtigungen beim Nutzer an.
+  Future<ReminderPermission> request();
+
+  /// Fragt nur die Benachrichtigungsberechtigung an (mit Abzeichen auf Apple-Geräten), ohne genaue Alarme:
+  /// für Meldungen zu Chat und Einkauf (#254).
+  Future<ReminderPermission> requestNotifications();
+
+  /// Öffnet die Benachrichtigungs-Einstellungen des Systems für die App. `false`, wenn die Plattform das
+  /// nicht bietet. Nötig, wenn das System nach einer Ablehnung keinen Dialog mehr zeigt (#57).
+  Future<bool> openSettings();
+
+  /// Ob [openSettings] auf dieser Plattform etwas öffnen kann.
+  bool get canOpenSettings;
+
+  /// Ersetzt alle geplanten Erinnerungen durch [planned].
+  Future<void> replaceAll(
+    List<PlannedReminder> planned, {
+    required String title,
+    required String Function(int minutesBefore) bodyFor,
+  });
+
+  /// Entfernt die Benachrichtigung [id], angezeigt oder noch geplant (Bestätigen, #218).
+  Future<void> dismiss(int id);
+
+  Future<void> cancelAll();
+}
+
+class LocalReminderScheduler implements ReminderScheduler {
+  LocalReminderScheduler([FlutterLocalNotificationsPlugin? plugin, bool? inAppTimers])
+      : _plugin = plugin ?? FlutterLocalNotificationsPlugin(),
+        _inAppTimers = inAppTimers ?? PlatformInfo.usesInAppReminders;
+
+  final FlutterLocalNotificationsPlugin _plugin;
+  static const String _channelId = 'reminders';
+  String _channelName = 'Erinnerungen';
+  String _channelDescription = '';
+  bool _ready = false;
+
+  /// Linux (E-50) und Windows (E-52): Das Plugin kann dort nicht verlässlich im Voraus planen (Linux: `zonedSchedule`
+  /// fehlt; Windows: geplante Toasts werden bei der Zustellung mit „Element nicht gefunden“ verworfen, auch bei
+  /// laufender App, geprüft mit Plugin 22.3.2; vermutlich fehlt eine Startmenü-Verknüpfung mit der App-Kennung). Die
+  /// App hält die Erinnerungen selbst und zeigt fällige an, solange sie läuft. Geprüft wird gegen die Uhrzeit (nicht
+  /// mit einem langen Timer), damit Erinnerungen auch nach einem Standby noch erscheinen.
+  final bool _inAppTimers;
+  late final InAppReminders _inApp = InAppReminders(
+    show: (id, title, body) => _plugin.show(
+      id: id,
+      title: title,
+      body: body,
+      notificationDetails: const NotificationDetails(linux: LinuxNotificationDetails()),
+    ),
+  );
+  /// Verpasste Erinnerungen erscheinen nur, wenn sie höchstens so alt sind.
+  static const Duration staleAfter = InAppReminders.staleAfter;
+
+  AndroidFlutterLocalNotificationsPlugin? get _android =>
+      _plugin.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+
+  IOSFlutterLocalNotificationsPlugin? get _ios =>
+      _plugin.resolvePlatformSpecificImplementation<IOSFlutterLocalNotificationsPlugin>();
+
+  MacOSFlutterLocalNotificationsPlugin? get _mac =>
+      _plugin.resolvePlatformSpecificImplementation<MacOSFlutterLocalNotificationsPlugin>();
+
+  /// Apple-Plattformen (iOS, macOS) verhalten sich gleich: Berechtigung auf Wunsch, begrenzte Anzahl.
+  bool get _isApple => _ios != null || _mac != null;
+
+  /// iOS hält höchstens 64 geplante Benachrichtigungen; die nächsten 60 werden geplant, der Rest
+  /// beim nächsten Öffnen der App (Neuplanung).
+  static const int iosMaxPending = 60;
+
+  @override
+  Future<void> initialize({required String channelName, required String channelDescription}) async {
+    TimeZones.ensureInitialized();
+    _channelName = channelName;
+    _channelDescription = channelDescription;
+    await _plugin.initialize(
+      settings: const InitializationSettings(
+        android: AndroidInitializationSettings('@mipmap/ic_launcher'),
+        // Berechtigungen werden erst auf ausdrücklichen Wunsch abgefragt (nicht beim Start).
+        iOS: DarwinInitializationSettings(
+          requestAlertPermission: false,
+          requestBadgePermission: false,
+          requestSoundPermission: false,
+        ),
+        macOS: DarwinInitializationSettings(
+          requestAlertPermission: false,
+          requestBadgePermission: false,
+          requestSoundPermission: false,
+        ),
+        linux: LinuxInitializationSettings(defaultActionName: 'FamilyNexus'),
+        // Windows: ohne diese Angabe wirft das Plugin beim Start und die App zeigt „Lokale Daten nicht lesbar“.
+        windows: WindowsInitializationSettings(
+          appName: 'FamilyNexus',
+          appUserModelId: 'de.inneso.FamilyNexus',
+          guid: '6f1c2a9e-3b7d-4c58-9a41-5d2e8b0c7f13',
+        ),
+      ),
+    );
+    _ready = true;
+  }
+
+  /// Das Plugin ist initialisiert. Die Meldungen zu Chat und Einkauf (#254) nutzen dieselbe Instanz und initialisieren
+  /// nicht selbst: `initialize` läuft genau einmal beim Start (`bootstrap`).
+  bool get ready => _ready;
+
+  /// Gemeinsame Plugin-Instanz für die Meldungen zu Chat und Einkauf.
+  FlutterLocalNotificationsPlugin get plugin => _plugin;
+
+  @override
+  Future<ReminderPermission> permission() async {
+    final ios = _ios;
+    final mac = _mac;
+    if (ios != null || mac != null) {
+      final o = ios != null ? await ios.checkPermissions() : await mac!.checkPermissions();
+      return (o?.isEnabled ?? false) ? ReminderPermission.granted : ReminderPermission.notificationsDenied;
+    }
+    final android = _android;
+    if (android == null) return ReminderPermission.granted;
+    final notifications = await android.areNotificationsEnabled() ?? false;
+    if (!notifications) return ReminderPermission.notificationsDenied;
+    final exact = await android.canScheduleExactNotifications() ?? false;
+    return exact ? ReminderPermission.granted : ReminderPermission.exactAlarmMissing;
+  }
+
+  @override
+  Future<ReminderPermission> request() async {
+    final ios = _ios;
+    final mac = _mac;
+    if (ios != null || mac != null) {
+      if (ios != null) {
+        await ios.requestPermissions(alert: true, badge: true, sound: true);
+      } else {
+        await mac!.requestPermissions(alert: true, badge: true, sound: true);
+      }
+      return permission();
+    }
+    final android = _android;
+    if (android == null) return ReminderPermission.granted;
+    await android.requestNotificationsPermission();
+    if (!(await android.canScheduleExactNotifications() ?? false)) {
+      await android.requestExactAlarmsPermission();
+    }
+    return permission();
+  }
+
+  @override
+  Future<ReminderPermission> requestNotifications() async {
+    final ios = _ios;
+    final mac = _mac;
+    if (ios != null) {
+      await ios.requestPermissions(alert: true, badge: true, sound: true);
+      return permission();
+    }
+    if (mac != null) {
+      await mac.requestPermissions(alert: true, badge: true, sound: true);
+      return permission();
+    }
+    final android = _android;
+    if (android == null) return ReminderPermission.granted;
+    await android.requestNotificationsPermission();
+    return permission();
+  }
+
+  @override
+  bool get canOpenSettings => _isApple;
+
+  /// iOS: Einstellungen der App; macOS 13+: Mitteilungen der App in den Systemeinstellungen.
+  @override
+  Future<bool> openSettings() async {
+    final Uri uri;
+    if (_ios != null) {
+      uri = Uri.parse('app-settings:');
+    } else if (_mac != null) {
+      uri = Uri.parse('x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=de.inneso.familynexus');
+    } else {
+      return false;
+    }
+    try {
+      return await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      AppLog.e('reminders', 'Systemeinstellungen nicht geöffnet', e);
+      return false;
+    }
+  }
+
+  @override
+  Future<void> replaceAll(
+    List<PlannedReminder> planned, {
+    required String title,
+    required String Function(int minutesBefore) bodyFor,
+  }) async {
+    if (!_ready) return;
+    if (_inAppTimers) return _replaceInApp(planned, title: title, bodyFor: bodyFor);
+    final android = _android;
+    try {
+      await _plugin.cancelAllPendingNotifications();
+      final exact = (await android?.canScheduleExactNotifications()) ?? false;
+      const darwin = DarwinNotificationDetails(
+        presentAlert: true,
+        presentBadge: false,
+        presentSound: true,
+        interruptionLevel: InterruptionLevel.active,
+      );
+      final details = NotificationDetails(
+        iOS: darwin,
+        macOS: darwin,
+        android: AndroidNotificationDetails(
+          _channelId,
+          _channelName,
+          channelDescription: _channelDescription,
+          importance: Importance.high,
+          priority: Priority.high,
+          category: AndroidNotificationCategory.reminder,
+          visibility: NotificationVisibility.private,
+          autoCancel: true,
+        ),
+      );
+      final list = !_isApple
+          ? planned
+          : (List<PlannedReminder>.of(planned)..sort((a, b) => a.fireAt.compareTo(b.fireAt))).take(iosMaxPending).toList();
+      for (final r in list) {
+        await _plugin.zonedSchedule(
+          id: r.id,
+          title: title,
+          body: bodyFor(r.minutesBefore),
+          scheduledDate: tz.TZDateTime.from(r.fireAt, tz.UTC),
+          notificationDetails: details,
+          androidScheduleMode: exact ? AndroidScheduleMode.exactAllowWhileIdle : AndroidScheduleMode.inexactAllowWhileIdle,
+        );
+      }
+    } catch (e) {
+      AppLog.e('reminders', 'Erinnerungen konnten nicht geplant werden', e);
+    }
+  }
+
+  void _replaceInApp(
+    List<PlannedReminder> planned, {
+    required String title,
+    required String Function(int minutesBefore) bodyFor,
+  }) =>
+      _inApp.replace(planned, title: title, bodyFor: bodyFor);
+
+  /// Zeigt fällige Erinnerungen (Linux, Windows); öffentlich nur für Tests.
+  Future<void> fireDue([DateTime? now]) => _inApp.fireDue(now);
+
+  @override
+  Future<void> dismiss(int id) async {
+    // Linux/Windows: noch nicht gezeigte Erinnerungen hält die App selbst.
+    _inApp.remove(id);
+    if (!_ready) return;
+    try {
+      await _plugin.cancel(id: id);
+    } catch (e) {
+      AppLog.e('reminders', 'Erinnerung konnte nicht entfernt werden', e);
+    }
+  }
+
+  @override
+  Future<void> cancelAll() async {
+    _inApp.clear();
+    try {
+      await _plugin.cancelAll();
+    } catch (e) {
+      AppLog.e('reminders', 'Erinnerungen konnten nicht entfernt werden', e);
+    }
+  }
+}

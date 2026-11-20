@@ -1,0 +1,169 @@
+import 'package:flutter/material.dart';
+
+import '../../app/app_services.dart';
+import '../../data/platform/reminder_scheduler.dart';
+import '../../domain/family.dart';
+import '../../domain/presence.dart';
+import '../../l10n/gen/app_localizations.dart';
+import '../../ui/widgets/clock_tick.dart';
+import '../calendar/anniversaries_screen.dart';
+import '../calendar/calendar_screen.dart' show SectionCard;
+import '../calendar/event_detail_screen.dart';
+import '../calendar/event_editor_screen.dart';
+import '../calendar/event_tile.dart';
+import '../calendar/widgets/anniversary_tile.dart';
+import '../family/member_avatar_view.dart';
+import '../presence/presence_view.dart';
+import '../reminders/permission_hint.dart';
+import '../reminders/reminders_screen.dart';
+
+/// „Heute“: nächste Termine, Erinnerungen, ungelesene Nachrichten.
+class TodayScreen extends StatelessWidget {
+  const TodayScreen({super.key, required this.onOpenChat, required this.onOpenShopping, required this.onOpenTasks, required this.onOpenAgenda});
+  final VoidCallback onOpenChat;
+  final VoidCallback onOpenShopping;
+
+  /// Wechselt in den Tab „Aufgaben“ (E-105).
+  final VoidCallback onOpenTasks;
+
+  /// Kalender in der Agenda ab heute (#218).
+  final VoidCallback onOpenAgenda;
+
+  /// Höchstzahl der Termine unter „Nächste Termine“ (#218).
+  static const int maxUpcoming = 3;
+
+  @override
+  Widget build(BuildContext context) {
+    final services = AppScope.of(context);
+    final c = services.calendar!;
+    final reminders = services.reminders;
+    final l = AppLocalizations.of(context);
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton(
+        heroTag: 'fab-today',
+        tooltip: l.calendarNewEvent,
+        onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => EventEditorScreen(controller: c))),
+        child: const Icon(Icons.add),
+      ),
+      body: ListenableBuilder(
+        listenable: Listenable.merge(<Listenable>[c, services.gateway, services.settings, ?reminders, ?services.shopping, ?services.tasks]),
+        builder: (context, _) {
+          final upcoming = c.upcoming(limit: maxUpcoming);
+          final unread = services.gateway.unreadCount;
+          final perm = reminders?.permission ?? ReminderPermission.granted;
+          return ListView(padding: const EdgeInsets.fromLTRB(16, 16, 16, 96), children: <Widget>[
+            if (perm != ReminderPermission.granted)
+              Builder(builder: (context) {
+                final hint = reminderPermissionHint(l, reminders, perm);
+                return SectionCard(
+                  title: l.remindersPermissionTitle,
+                  trailing: TextButton(onPressed: hint.onPressed, child: Text(hint.action)),
+                  child: Text(hint.text),
+                );
+              }),
+            SectionCard(
+              title: l.todayNext,
+              trailing: TextButton(onPressed: onOpenAgenda, child: Text(l.todayAllEvents)),
+              child: upcoming.isEmpty
+                  ? Text(l.todayNoUpcoming)
+                  : Column(children: <Widget>[
+                      for (final o in upcoming)
+                        EventTile(
+                          occurrence: o,
+                          controller: c,
+                          onTap: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => EventDetailScreen(controller: c, occurrence: o))),
+                        ),
+                    ]),
+            ),
+            // Geburts- und Gedenktage innerhalb der Vorlaufzeit (E-104); ohne Treffer entfällt die Karte. Im
+            // ClockTick, damit der Tageswechsel ohne Datenänderung greift.
+            if (c.anniversaries != null)
+              ClockTick(builder: (context) {
+                final due = c.anniversariesDue(services.settings.settings.anniversaryLeadDays);
+                if (due.isEmpty) return const SizedBox.shrink();
+                return SectionCard(
+                  title: l.anniversariesTodayTitle,
+                  trailing: TextButton(
+                    onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => AnniversariesScreen(controller: c))),
+                    child: Text(l.anniversariesTitle),
+                  ),
+                  child: Column(children: <Widget>[for (final h in due) AnniversaryTile(hit: h, showWhen: true)]),
+                );
+              }),
+            // Im Browser gibt es keine Erinnerungen (E-53, #145): keine Karte.
+            if (reminders != null)
+              SectionCard(
+                title: l.remindersTitle,
+                trailing: TextButton(
+                  onPressed: () => Navigator.of(context)
+                      .push(MaterialPageRoute<void>(builder: (_) => RemindersScreen(reminders: reminders, calendar: c))),
+                  child: Text(l.remindersOverview),
+                ),
+                // Fällig wird eine Erinnerung mit der Zeit, ohne dass sich Daten ändern.
+                child: ClockTick(builder: (context) {
+                  final due = reminders.dueCount;
+                  return Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+                    // „Keine Erinnerung geplant“ neben „n fällig“ liest sich als Widerspruch (#498).
+                    if (reminders.plannedCount > 0 || due == 0) Text(l.remindersPlanned(reminders.plannedCount)),
+                    if (due > 0) Text(l.remindersDueCount(due)),
+                  ]);
+                }),
+              ),
+            SectionCard(
+              title: l.todayOnlineHeader,
+              child: PresenceBuilder(builder: (context, now) => _OnlineList(services: services, now: now)),
+            ),
+            if (services.shopping != null)
+              SectionCard(
+                title: l.shoppingTitle,
+                trailing: TextButton(onPressed: onOpenShopping, child: Text(l.tabShopping)),
+                child: Text(l.todayShoppingOpen(services.shopping!.openCount)),
+              ),
+            if (services.tasks != null)
+              SectionCard(
+                title: l.tasksTitle,
+                trailing: TextButton(onPressed: onOpenTasks, child: Text(l.tasksTitle)),
+                child: Text(l.todayTasksOpen(services.tasks!.myOpenCount)),
+              ),
+            SectionCard(
+              title: l.todayUnread,
+              trailing: TextButton(onPressed: onOpenChat, child: Text(l.todayOpenChat)),
+              child: Text(l.todayUnreadCount(unread)),
+            ),
+          ]);
+        },
+      ),
+    );
+  }
+}
+
+/// Die anderen beigetretenen Mitglieder, die gerade online sind.
+class _OnlineList extends StatelessWidget {
+  const _OnlineList({required this.services, required this.now});
+  final AppServices services;
+  final DateTime now;
+
+  @override
+  Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context);
+    final f = services.gateway.family;
+    final online = <FamilyMember>[
+      if (f != null)
+        for (final m in f.joined)
+          if (m.userId != f.myUserId && presenceOf(services, m.userId, now).status == PresenceStatus.online) m,
+    ];
+    if (online.isEmpty) return Text(l.todayNobodyOnline);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+      for (final m in online)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(children: <Widget>[
+            MemberAvatarView(userId: m.userId, size: 28, colorIndex: personColorOf(services, m.userId), online: true),
+            const SizedBox(width: 8),
+            Flexible(child: Text('${m.displayName} – ${l.presenceOnline}')),
+          ]),
+        ),
+    ]);
+  }
+}

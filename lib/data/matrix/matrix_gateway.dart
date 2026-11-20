@@ -1,0 +1,429 @@
+import 'package:flutter/foundation.dart';
+
+import '../../domain/account_deletion.dart';
+import '../../domain/anniversaries.dart';
+import '../../domain/calendar_event.dart';
+import '../../domain/calendar_signal.dart';
+import '../../domain/chat.dart';
+import '../../domain/data_inventory.dart';
+import '../../domain/event_themes.dart';
+import '../../domain/family.dart';
+import '../../domain/invite_link.dart';
+import '../../domain/member_avatars.dart';
+import '../../domain/moderation.dart';
+import '../../domain/password_change.dart';
+import '../../domain/presence.dart';
+import '../../domain/registration.dart';
+import '../../domain/security.dart';
+import '../../domain/server.dart';
+import '../../domain/shopping.dart';
+import '../../domain/tasks.dart';
+
+enum SessionState { loggedOut, ready }
+
+/// Fehlerarten, die die UI lokalisiert darstellt. Enthalten nie Inhalte.
+enum GatewayError {
+  invalidCredentials,
+  serverUnreachable,
+  serverUnsupported,
+  notAllowed,
+  attachmentRejected,
+  invalidInput,
+  notFound,
+  encryptionUnavailable,
+
+  /// Der Server verlangt eine erneute Passwortbestätigung.
+  reauthRequired,
+  alreadyExists,
+  rateLimited,
+
+  // Kontoanlage (E-55)
+  usernameTaken,
+  usernameInvalid,
+  weakPassword,
+  registrationDisabled,
+  emailInUse,
+
+  /// Die Anmeldung beim Anbieter ist gescheitert: keine Seite geöffnet, fehlender Code oder anderer Fehler des
+  /// Anbieters. Wird als Fehler angezeigt.
+  oauthCancelled,
+
+  /// Die Anmeldung beim Anbieter wurde nicht abgeschlossen: Abbruch durch die Person (Seite geschlossen, Ablehnung
+  /// `access_denied`), Zeitablauf oder Ende der Sitzung ohne Rücksprung. Kein Fehler; wird als Hinweis angezeigt (#430).
+  oauthAborted,
+
+  /// Rücksprung gehört nicht zur laufenden Anmeldung (fremder `state`); sie läuft weiter.
+  oauthStateMismatch,
+
+  /// Der Anbieter erlaubt keine Passwortänderung über die App (#117).
+  passwordChangeUnavailable,
+  unknown,
+}
+
+/// Die Sitzung konnte beim Start nicht wiederhergestellt werden (#134). [sessionLost]: Das SDK kann sie dabei
+/// gelöscht haben; sonst liegt sie noch unversehrt in der Datenbank.
+class SessionRestoreException implements Exception {
+  const SessionRestoreException({required this.sessionLost});
+  final bool sessionLost;
+
+  @override
+  String toString() => 'SessionRestoreException(sessionLost: $sessionLost)';
+}
+
+class GatewayException implements Exception {
+  const GatewayException(this.error);
+  final GatewayError error;
+
+  @override
+  String toString() => 'GatewayException(${error.name})';
+}
+
+/// Einzige Schnittstelle zwischen App und Matrix (E-04).
+///
+/// Zusicherungen aller Implementierungen:
+/// * Räume der App sind immer Ende-zu-Ende-verschlüsselt (kein Abschalten).
+/// * Rechte (Moderator) werden hier erneut geprüft, nicht nur in der UI.
+/// * Fehler enthalten keine Nachrichteninhalte.
+abstract class MatrixGateway implements Listenable {
+  SessionState get session;
+
+  /// Der Server hat die Sitzung beendet (Token ungültig, z. B. weil das Konto gelöscht wurde), die Person hat sich nicht
+  /// selbst abgemeldet (#556). Nur im Arbeitsspeicher; gilt, solange niemand angemeldet ist, bis zur nächsten Anmeldung.
+  bool get sessionEndedByServer;
+  String? get userId;
+
+  /// Server, an dem die Sitzung läuft (nur wenn angemeldet).
+  ServerUrl? get server;
+
+  /// Die Familie des Nutzers oder `null`, solange keine gegründet/beigetreten ist.
+  Family? get family;
+
+  /// Nachrichten des Familienchats, älteste zuerst (Kurzform für `messagesIn(ChatThread.familyId)`).
+  List<ChatMessage> get messages;
+
+  /// Alle Gespräche: Familienchat zuerst, danach die Einzelchats mit aktuellen Familienmitgliedern
+  /// (nach Anzeigename). Einzelchats mit Entfernten oder nicht verschlüsselte Räume fehlen (E-39).
+  List<ChatThread> get threads;
+
+  /// Nachrichten eines Gesprächs, älteste zuerst; leer für unbekannte Gespräche.
+  List<ChatMessage> messagesIn(String threadId);
+
+  /// `true`, sobald der erste Abgleich mit dem Server stattgefunden hat (oder
+  /// lokale Daten einer früheren Sitzung vorliegen). Davor ist „keine Familie“
+  /// nicht aussagekräftig.
+  bool get initialSyncDone;
+
+  /// Startet den Abgleich neu, z. B. wenn „Synchronisiere …“ ungewöhnlich lange steht (#24).
+  Future<void> retrySync();
+
+  /// Anzahl ungelesener Chatnachrichten aller Gespräche (ohne eigene).
+  int get unreadCount;
+
+  /// Ungelesene Nachrichten eines Gesprächs.
+  int unreadIn(String threadId);
+
+  /// Älteste ungelesene Nachricht eines Gesprächs nach denselben Regeln wie [unreadIn], sonst `null`
+  /// (#254: Marke „Neue Nachrichten“). Vor [markChatRead] abzufragen.
+  String? firstUnreadIdIn(String threadId);
+
+  /// Server-Zeitstempel, ab dem Nachrichten und Signale als neu gelten (Meldungen, #254, E-88). `null` bis zum ersten
+  /// echten Sync der Sitzung und nach dem Abmelden; Ereignisse mit Zeitstempel ≤ diesem Wert werden nie gemeldet.
+  DateTime? get liveSince;
+
+  /// Bildet die Nachrichten neu ab, damit Lesestände (`readBy`) der aktuellen Einstellung „Lesebestätigung senden“
+  /// folgen (#526, E-106). Der Abgleich ist entprellt; es gibt keinen Netzwerkzugriff.
+  void refreshReadStates();
+
+  /// Markiert ein Gespräch bis zur letzten Nachricht als gelesen. Öffentlich (`m.read`) nur bei eingeschalteter
+  /// Lesebestätigung, sonst privat (#526, E-106).
+  Future<void> markChatRead({String threadId = ChatThread.familyId});
+
+  /// Lädt ältere Nachrichten eines Gesprächs nach (Paginierung).
+  Future<void> loadOlderMessages({String threadId = ChatThread.familyId});
+
+  /// Eröffnet einen Einzelchat mit einem beigetretenen Familienmitglied (oder liefert den
+  /// vorhandenen) und gibt die Gesprächskennung zurück. Der Raum ist immer verschlüsselt (E-39).
+  Future<String> startDirectChat(String userId);
+
+  /// Stellt eine gespeicherte Sitzung wieder her (falls vorhanden).
+  Future<void> restore();
+
+  /// Prüft Erreichbarkeit/Protokollversion und ermittelt den Betreiber.
+  Future<ServerInfo> probeServer(ServerUrl url);
+
+  Future<void> login({
+    required ServerUrl server,
+    required String username,
+    required String password,
+  });
+
+  Future<void> logout();
+
+  // ------------------------------------------------- Kontolöschung (#12)
+
+  /// Wie das angemeldete Konto gelöscht wird. Anmeldung im Browser (OAuth): Löschseite des Anbieters;
+  /// kennt der Anbieter keine Kontoseite, `serverUnsupported`.
+  Future<AccountDeletion> accountDeletion();
+
+  /// Löscht das Konto beim Anbieter dauerhaft (nur [AccountDeletionInApp]; sonst `notAllowed`) und
+  /// beendet danach die Sitzung lokal. Falsches Passwort: `invalidCredentials`. Das Passwort wird
+  /// nicht gespeichert.
+  Future<void> deleteAccount({required String password});
+
+  /// Wie das Passwort des angemeldeten Kontos geändert wird (#117). Anmeldung im Browser (OAuth):
+  /// Kontoseite des Anbieters; kennt er keine, [PasswordChangeUnavailable].
+  Future<PasswordChange> passwordChange();
+
+  /// Ändert das Passwort (nur [PasswordChangeInApp]; sonst `notAllowed`). Falsches [oldPassword]:
+  /// `invalidCredentials`; Ablehnung durch den Anbieter: `passwordChangeUnavailable`. Mit
+  /// [logoutOtherDevices] enden alle anderen Sitzungen, die aktuelle bleibt. Passwörter werden nicht
+  /// gespeichert.
+  Future<void> changePassword({required String oldPassword, required String newPassword, required bool logoutOtherDevices});
+
+  /// Nach der Löschung im Browser: `true`, wenn der Anbieter das Konto nicht mehr annimmt (gelöscht
+  /// oder Sitzung beendet). Die Sitzung wird dann lokal beendet.
+  Future<bool> checkAccountDeleted();
+
+  // ------------------------------------------------------ Kontoanlage (E-55)
+
+  /// Wie bei [server] ein Konto angelegt wird (klassisch in der App, im Browser oder gar nicht).
+  Future<RegistrationOptions> registrationOptions(ServerUrl server);
+
+  /// Ist der Benutzername frei? Netzfehler ergeben `unknown` statt einer Ausnahme.
+  Future<UsernameCheck> checkUsername(ServerUrl server, String username);
+
+  /// Startet die klassische Registrierung. Liefert den nächsten Zusatzschritt oder `null`, wenn das
+  /// Konto angelegt und die Sitzung bereit ist. Das Passwort bleibt nur im Arbeitsspeicher, bis die
+  /// Registrierung endet oder abgebrochen wird.
+  Future<RegistrationStage?> register({
+    required ServerUrl server,
+    required String username,
+    required String password,
+    required String displayName,
+
+    /// Bevorzugte Sprache für die Bedingungen des Anbieters.
+    String language = 'de',
+  });
+
+  /// Setzt die laufende Registrierung mit der Antwort der Person fort (wie [register]).
+  Future<RegistrationStage?> continueRegistration(RegistrationInput input);
+
+  /// Bricht eine laufende Registrierung ab und vergisst das Passwort.
+  void cancelRegistration();
+
+  /// Bereitet die Anmeldung bzw. Kontoanlage ([create]) auf der Seite des Anbieters vor (OAuth) und
+  /// liefert die zu öffnende Adresse. [redirectUri] ist die Rücksprungadresse der App.
+  Future<Uri> startOAuth({required ServerUrl server, required Uri redirectUri, required bool create});
+
+  /// Schließt die Anmeldung mit der Rücksprungadresse ab, zu der die Seite des Anbieters zurückgesprungen ist.
+  /// Fremder `state`: `oauthStateMismatch` (die Anmeldung bleibt offen); Ablehnung beim Anbieter
+  /// (`error=access_denied`): `oauthAborted`; anderer Fehler des Anbieters oder fehlender Code: `oauthCancelled`.
+  Future<void> completeOAuth(Uri callback);
+
+  /// Setzt den eigenen Anzeigenamen.
+  Future<void> setDisplayName(String name);
+
+  /// Gibt alle Ressourcen frei (Datenbank schließen), z. B. vor der vollständigen Löschung.
+  Future<void> close();
+
+  /// Gründet die Familie: privater, verschlüsselter Raum (E-12).
+  Future<void> createFamily(String name);
+
+  Future<void> sendMessage(String text, {String? replyToId, String threadId = ChatThread.familyId});
+  Future<void> sendReaction(String messageId, String emoji, {String threadId = ChatThread.familyId});
+
+  /// Prüft gegen die [AttachmentPolicy] und sendet.
+  Future<void> sendAttachment({
+    required String fileName,
+    required Uint8List bytes,
+    String? replyToId,
+    String threadId = ChatThread.familyId,
+  });
+
+  /// Meldet eine **fremde** Nachricht beim Betreiber des Homeservers (Matrix `report`, E-48). Eigene Nachrichten
+  /// und unbekannte Ereignisse werden abgelehnt (`notAllowed`/`notFound`). Übertragen werden nur Raum,
+  /// Ereignis-ID und der Grundtext aus [ReportRequest.reason], nie der Nachrichteninhalt.
+  Future<void> reportMessage(ReportRequest request);
+
+  /// Wiederholt das Senden einer fehlgeschlagenen Nachricht aus dem ursprünglichen Aufruf. Ohne offene Sendung in
+  /// diesem Thread und Raum, etwa nach einem Neustart: `notFound` ([ChatMessage.retryable]).
+  Future<void> retryMessage(String messageId, {String threadId = ChatThread.familyId});
+
+  // --------------------------------------------- Sicherheit und Verifizierung
+
+  SecurityState get securityState;
+
+  /// Aktualisiert Geräteliste und Schlüsselstatus vom Server.
+  Future<void> refreshSecurity();
+
+  /// Gleicht jetzt mit dem Homeserver ab (#358): ein Sync, der einen laufenden abwartet. Fehler (kein Netz, nicht
+  /// angemeldet) werden protokolliert und nicht geworfen; der nächste Abgleich versucht es erneut.
+  Future<void> syncNow();
+
+  /// Alle Geräte des eigenen Kontos.
+  List<DeviceEntry> get devices;
+
+  /// Laufende Geräte-/Personenverifizierung (oder `null`).
+  VerificationInfo? get verification;
+
+  /// Richtet beim ersten Gerät Schlüssel-Backup und Cross-Signing ein. Verlangt der Server eine
+  /// Passwortbestätigung und ist [password] nicht gesetzt, wird `reauthRequired` gemeldet
+  /// (das Passwort wird nie gespeichert). Liefert den Wiederherstellungsschlüssel, der
+  /// **einmalig** angezeigt werden muss.
+  Future<String> setUpSecurity({String? password});
+
+  /// Stellt mit dem Wiederherstellungsschlüssel das Backup wieder her und verifiziert dieses Gerät.
+  Future<void> restoreSecurity(String recoveryKey);
+
+  /// Ersetzt den Wiederherstellungsschlüssel durch einen neuen (#11), z. B. wenn der alte verloren ist.
+  /// Nur auf einem verifizierten Gerät (sonst `notAllowed`); die Identität bleibt, andere Geräte und
+  /// die Familie merken nichts. Der alte Schlüssel schaltet danach keine Geräte mehr frei. Liefert
+  /// den neuen Schlüssel, der **einmalig** angezeigt werden muss.
+  Future<String> resetRecoveryKey();
+
+  /// Startet eine Emoji-Verifizierung mit einem eigenen Gerät ([deviceId]) oder, ohne
+  /// [deviceId], mit einer anderen Person.
+  Future<void> startVerification({required String userId, String? deviceId});
+
+  Future<void> acceptVerification();
+
+  /// Antwort auf den Emoji-Vergleich.
+  Future<void> confirmEmojiMatch(bool matches);
+
+  Future<void> cancelVerification();
+
+  /// Akzeptiert den geänderten Cross-Signing-Schlüssel eines Mitglieds und hebt die Sperre
+  /// seiner Geräte auf. Erst nach persönlicher Prüfung (z. B. Emoji-Vergleich) aufrufen.
+  Future<void> acceptIdentityChange(String userId);
+
+  // ------------------------------------------------- Einladungen und Rollen
+
+  /// Offene Einladungen in Räume (noch nicht angenommen).
+  List<PendingInvitation> get invitations;
+
+  /// `true`, solange eine eigene Beitrittsanfrage (Knock) auf Bestätigung wartet.
+  bool get joinRequestPending;
+
+  /// Die letzte Beitrittsanfrage wurde von einem Moderator abgelehnt (bis [cancelJoinRequest] oder eine neue Anfrage).
+  bool get joinRequestRejected;
+
+  /// Technischer Stand der Ablehnungs-Abfrage für „Details“ (nur Arbeitsspeicher, ohne Raum-IDs, MXIDs und Fehlertexte).
+  String get joinRequestDiagnostic;
+
+  /// Zieht die eigene wartende Beitrittsanfrage zurück.
+  Future<void> cancelJoinRequest();
+
+  /// Moderator: erzeugt einen zeitlich begrenzten, einmaligen Einladungslink/QR-Inhalt.
+  Future<String> createInviteLink({Duration validity = InviteLink.defaultValidity, String? accountServer});
+
+  /// Sendet eine Beitrittsanfrage für den (geprüften, nicht abgelaufenen) Link.
+  Future<void> requestToJoin(InviteLink link);
+
+  /// Beitrittsanfrage über den Familien-Code (Raum-ID) ohne Einladungslink; ein Moderator muss bestätigen (E-65).
+  Future<void> requestToJoinByCode(String code);
+
+  /// Moderator: lädt eine Matrix-ID direkt ein.
+  Future<void> inviteUser(String userId);
+
+  /// Moderator: bestätigt eine Beitrittsanfrage (→ Einladung); nur mit gültigem eigenem Link.
+  Future<void> approveRequest(String userId);
+
+  /// Moderator: lehnt eine Beitrittsanfrage ab oder zieht eine Einladung zurück.
+  Future<void> rejectRequest(String userId);
+
+  /// Moderator: ernennt ein Mitglied zum Moderator (Power-Level 50).
+  Future<void> promote(String userId);
+
+  /// Moderator: entfernt ein Mitglied; die Raumschlüssel werden rotiert.
+  Future<void> removeMember(String userId);
+
+  Future<void> renameFamily(String name);
+
+  /// Nimmt eine Einladung an; ab dann ist der Raum die Familie dieses Kontos.
+  Future<void> acceptInvitation(String roomId);
+
+  Future<void> declineInvitation(String roomId);
+
+  // ------------------------------------------------------------ Kalender
+
+  /// Empfangene Kalender-Ereignisse (auch Wiederholungen bereits bekannter und
+  /// eigene Echos; der Empfänger muss idempotent sein).
+  Stream<CalendarSignal> get calendarSignals;
+
+  /// Sendet einen **geteilten** Termin verschlüsselt in den Familienraum.
+  /// Wirft [GatewayException] (`invalidInput`) für nicht geteilte Termine.
+  Future<void> publishSharedEvent(CalendarEvent event);
+
+  /// Sendet einen **privaten** Termin ausschließlich in den privaten Raum des
+  /// eigenen Kontos (Geräte-Sync). Nie in den Familienraum.
+  Future<void> publishPrivateEvent(CalendarEvent event);
+
+  Future<void> publishRsvp(String eventId, RsvpStatus status, DateTime timestamp);
+
+  /// Teilt einen geteilten Termin als Karte im Chat.
+  Future<void> shareEventInChat(CalendarEvent event);
+
+  /// Lädt (und entschlüsselt) einen Anhang. Wird nie automatisch geöffnet.
+  Future<Uint8List> loadAttachment(String messageId, {String threadId = ChatThread.familyId});
+
+  // ------------------------------------------------------- Online-Status
+
+  /// Letzte bekannte Meldungen der anderen beigetretenen Familienmitglieder (nur Arbeitsspeicher).
+  /// Mit [PresenceBoard.evaluate] zum Anzeigezeitpunkt auswerten.
+  Map<String, PresenceStamp> get presence;
+
+  /// Meldet den eigenen Zustand als Ende-zu-Ende-verschlüsselte Gerätenachricht an die Geräte der
+  /// beigetretenen Familienmitglieder (alle oder nur [onlyTo]). [ask] bittet online befindliche
+  /// Geräte um eine Antwort (nur zusammen mit [online]). Es gibt nie einen Klartext-Weg (E-38).
+  Future<void> announcePresence({required bool online, bool ask = false, String? onlyTo});
+
+  /// Mitglieder, die um eine Statusantwort gebeten haben.
+  Stream<String> get presenceAsks;
+
+  // -------------------------------------------------------- Einkaufszettel
+
+  /// Sendet einen Eintrag der Einkaufsliste verschlüsselt in den Familienraum (E-40).
+  Future<void> publishShoppingItem(ShoppingItem item);
+
+  // ----------------------------------------------------------- Aufgabenlisten
+
+  /// Sendet eine Aufgabenliste (Definition) verschlüsselt in den Familienraum (E-51).
+  Future<void> publishTaskList(TaskList list);
+
+  /// Sendet einen Protokolleintrag einer Aufgabenliste verschlüsselt in den Familienraum (E-51).
+  Future<void> publishTaskLog(TaskLogEntry entry);
+
+  // ------------------------------------------------------------ Kalender-Themen
+
+  /// Sendet ein Kalender-Thema (ein Ereignis je Thema) verschlüsselt in den Familienraum (E-99).
+  Future<void> publishEventTheme(EventTheme theme);
+
+  // ------------------------------------------------------------ Geburts- und Gedenktage
+
+  /// Sendet einen Geburts-/Gedenktag-Eintrag (ein Ereignis je Person) verschlüsselt in den Familienraum (E-104).
+  Future<void> publishAnniversary(AnniversaryPerson person);
+
+  // ------------------------------------------------------------ Avatare
+
+  /// Gültige Avatar-Kennung (`p01`…`p12`) der Person oder `null` („kein Avatar“, unbekannt, vor dem ersten Aufbau der
+  /// Familie). Direktes Nachschlagen im Raumzustand des Familienraums (E-101); Nicht-Mitglieder blendet die Anzeige aus.
+  String? avatarOf(String userId);
+
+  /// Zählt nur hoch, wenn sich Avatar, Anzeigename oder Beitrittsstatus eines Mitglieds ändert (nicht bei jedem Sync).
+  ValueListenable<int> get avatarRevision;
+
+  /// Ob die eigene Person ihren Avatar setzen darf (E-101): `unknown` vor dem ersten Aufbau der Familie.
+  AvatarAvailability get avatarAvailability;
+
+  /// Setzt den eigenen Avatar als Raumzustand im Familienraum (nicht Ende-zu-Ende-verschlüsselt, ein Wert aus
+  /// zwölf); `null` = kein Avatar (leerer Inhalt). Wirft `notAllowed` ohne Berechtigung oder bei ungültiger Kennung.
+  Future<void> setMemberAvatar(String? preset);
+
+  // ------------------------------------------------------------ Datenprotokoll
+
+  /// Bestandsaufnahme der beim Anbieter gespeicherten Daten des Kontos: Profil, Geräte,
+  /// Kontodaten-Arten und Räume samt der auf diesem Gerät zwischengespeicherten Ereignisse.
+  /// Schlüssel und verschlüsselte Inhalte werden nie ausgegeben. [refresh]: Profil und Geräteliste
+  /// vorher beim Anbieter abfragen (sonst nur lokale Daten). Wirft `notAllowed`, wenn abgemeldet.
+  Future<OnlineInventory> dataInventory({bool refresh = true});
+}

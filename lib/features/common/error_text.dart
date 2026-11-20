@@ -1,0 +1,70 @@
+import '../../data/matrix/matrix_gateway.dart';
+import '../../domain/anniversaries.dart';
+import '../../domain/anniversary_service.dart';
+import '../../domain/event_theme_service.dart';
+import '../../domain/event_themes.dart';
+import '../../domain/shopping.dart';
+import '../../domain/tasks.dart';
+import '../../l10n/gen/app_localizations.dart';
+
+/// Ob [error] nur ein Hinweis ist, kein Fehler: Die Anmeldung beim Anbieter wurde nicht abgeschlossen (#430).
+bool isNotice(Object error) => error is GatewayException && error.error == GatewayError.oauthAborted;
+
+/// Lokalisierter Text zu einem Fehler. Zeigt nie Rohtexte von Servern oder Ausnahmen.
+String errorText(AppLocalizations l, Object error) {
+  if (error is GatewayException) {
+    return switch (error.error) {
+      GatewayError.invalidCredentials => l.errInvalidCredentials,
+      GatewayError.serverUnreachable => l.errServerUnreachable,
+      GatewayError.serverUnsupported => l.errServerUnsupported,
+      GatewayError.notAllowed => l.errNotAllowed,
+      GatewayError.attachmentRejected => l.errAttachmentRejected,
+      GatewayError.invalidInput => l.errInvalidInput,
+      GatewayError.notFound => l.errNotFound,
+      GatewayError.encryptionUnavailable => l.errEncryption,
+      GatewayError.reauthRequired => l.errReauth,
+      GatewayError.alreadyExists => l.errAlreadyExists,
+      GatewayError.rateLimited => l.errRateLimited,
+      GatewayError.usernameTaken => l.errUsernameTaken,
+      GatewayError.usernameInvalid => l.errUsernameInvalid,
+      GatewayError.weakPassword => l.errWeakPassword,
+      GatewayError.registrationDisabled => l.errRegistrationDisabled,
+      GatewayError.emailInUse => l.errEmailInUse,
+      GatewayError.oauthCancelled || GatewayError.oauthStateMismatch => l.errOAuthCancelled,
+      GatewayError.oauthAborted => l.errOAuthAborted,
+      GatewayError.passwordChangeUnavailable => l.passwordChangeUnavailable,
+      GatewayError.unknown => l.errUnknown,
+    };
+  }
+  if (error is ShoppingException) {
+    return switch (error.error) {
+      ShoppingError.invalid => l.shoppingInvalid,
+      ShoppingError.notFound => l.errNotFound,
+      ShoppingError.limit => l.shoppingLimit,
+    };
+  }
+  if (error is TaskException) {
+    return switch (error.error) {
+      TaskError.invalid => l.tasksInvalid,
+      TaskError.notFound => l.errNotFound,
+      TaskError.limit => l.tasksLimit,
+      TaskError.notAllowed => l.errNotAllowed,
+    };
+  }
+  if (error is EventThemeException) {
+    return switch (error.error) {
+      EventThemeError.invalid => l.themeInvalid(EventTheme.maxName),
+      EventThemeError.notFound => l.errNotFound,
+      EventThemeError.limit => l.themeLimit(EventTheme.maxActive),
+      EventThemeError.notAllowed => l.errNotAllowed,
+    };
+  }
+  if (error is AnniversaryException) {
+    return switch (error.error) {
+      AnniversaryError.invalid => l.anniversaryInvalid(AnniversaryPerson.maxName),
+      AnniversaryError.notFound => l.errNotFound,
+      AnniversaryError.limit => l.anniversaryLimit(AnniversaryPerson.maxActive),
+    };
+  }
+  return l.errUnknown;
+}
